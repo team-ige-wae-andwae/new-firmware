@@ -1,0 +1,35 @@
+{
+  "idf_version": "ESP-IDF v6.0.1",
+  "target": "esp32s3",
+  "source_files": [
+    {
+      "path": "csi_node/CMakeLists.txt",
+      "sha256": "3ebaf944e060d0c3a26e66041ed277cfe1b14f41cb617e2a4275135f0fe60710"
+    },
+    {
+      "path": "csi_node/sdkconfig.defaults",
+      "sha256": "d81cb4b661416ad19741b3da1c8c1e4a065bf449f68b53c00c5c22a701c8ca9a"
+    },
+    {
+      "path": "csi_node/main/CMakeLists.txt",
+      "sha256": "aa87929e31f6cf0de62b3007b427cac2fe52282464692e638535b11c13fda2fb"
+    },
+    {
+      "path": "csi_node/main/app_main.c",
+      "sha256": "f58704a82e5d82095854c7f394008f4ca2a4103ba49f213c1cabcc5bf4a68e9d"
+    },
+    {
+      "path": "csi_node/main/node_protocol.h",
+      "sha256": "8cd669e9fc36e87d029fee845f4bdbaa54769ebce2a1722b54239036d53ffd74"
+    }
+  ],
+  "binary_files": [
+    "bootloader/bootloader.bin",
+    "partition_table/partition-table.bin",
+    "csi_node.bin"
+  ],
+  "app_sha256": "d7fb37c551f084caa721550598c4124d1855fc896347ce046c592c9ed9d50e24",
+  "app_bytes": 743008,
+  "hardware_validation": "2026-10-14: this exact application binary passed a two-board A/C 1X3 and 2X2 hardware test; four-board and long-duration tests are pending.",
+  "source_hash_note": "Repository source hashes use LF line endings. Original verified build inputs match this source except for CRLF/LF normalization."
+}
