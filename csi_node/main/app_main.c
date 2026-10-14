@@ -47,7 +47,7 @@ static const uint8_t broadcast[6] = {255,255,255,255,255,255};
 static const char *TAG = "csi_node";
 static portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t csi_queue, event_queue, command_queue;
-static node_config_t config = {.id = 0, .mode = NODE_MODE_1X3, .rate_hz = 40, .phase_ms = 5000};
+static node_config_t config = {.id = 0, .mode = NODE_MODE_RR4, .rate_hz = 20, .phase_ms = 50};
 static node_packet_t grant;
 static uint8_t factory_mac[6], active_mac[6];
 static bool running, fault, radio_up, have_grant, response_sent, tx_pending;
@@ -57,6 +57,7 @@ static uint8_t pending_type;
 static int64_t grant_received_us, send_started_us, next_slot_us;
 static uint32_t tx_count, csi_count, csi_dropped, late_dropped, send_errors;
 static uint32_t grant_rx_count, grant_age_min = UINT32_MAX, grant_age_max, grant_expired;
+static uint32_t csi_len_min = UINT32_MAX, csi_len_max, csi_invalid_length_dropped;
 static uint32_t tx_completions[2], tx_age_min[2] = {UINT32_MAX, UINT32_MAX}, tx_age_max[2];
 static uint32_t guard_extensions, fault_type, fault_age_us;
 static uint64_t guard_extension_us;
@@ -77,6 +78,7 @@ static void status(void)
     node_config_t c;
     uint32_t sid, phase, slot, tx, rx, drops, late, errors;
     uint32_t grants, youngest, oldest, expired;
+    uint32_t min_csi_len, max_csi_len, invalid_csi_lengths;
     uint32_t completed[2], tx_min[2], tx_max[2], extensions, fault_packet, fault_age;
     uint64_t extension_us;
     bool run, bad;
@@ -86,6 +88,8 @@ static void status(void)
     tx = tx_count; rx = csi_count; drops = csi_dropped;
     late = late_dropped; errors = send_errors;
     grants = grant_rx_count; youngest = grant_age_min; oldest = grant_age_max; expired = grant_expired;
+    min_csi_len = csi_len_min; max_csi_len = csi_len_max;
+    invalid_csi_lengths = csi_invalid_length_dropped;
     memcpy(completed, tx_completions, sizeof(completed));
     memcpy(tx_min, tx_age_min, sizeof(tx_min));
     memcpy(tx_max, tx_age_max, sizeof(tx_max));
@@ -97,7 +101,7 @@ static void status(void)
     emit("NODE_STATUS,%s,%s,%u,%" PRIu32 ",%s,%" PRIu32 ",%" PRIu32 ",%" PRIu32
          ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32
          "," MACSTR "," MACSTR,
-         id, c.mode == 2 ? "2X2" : "1X3", c.rate_hz, c.phase_ms,
+         id, node_mode_name(c.mode), c.rate_hz, c.phase_ms,
          bad ? "FAULT" : run ? (c.id == 1 ? "RUNNING" : "ARMED") : "STOPPED",
          sid, phase, slot, tx, rx, drops, late, errors,
          MAC2STR(active_mac), MAC2STR(factory_mac));
@@ -109,6 +113,8 @@ static void status(void)
          tx_min[1] == UINT32_MAX ? 0 : tx_min[1], tx_max[1], extensions, extension_us,
          fault_packet == NODE_GRANT ? "GRANT" : fault_packet == NODE_DATA ? "DATA" :
          fault_packet == 3 ? "SLOT" : "NONE", fault_age);
+    emit("NODE_CSI_STATS,%" PRIu32 ",%" PRIu32 ",%" PRIu32,
+         min_csi_len == UINT32_MAX ? 0 : min_csi_len, max_csi_len, invalid_csi_lengths);
 }
 
 static void mark_fault_locked(uint32_t type, uint32_t age)
@@ -193,7 +199,7 @@ static void send_cb(const esp_now_send_info_t *info, esp_now_send_status_t resul
 static void csi_cb(void *ctx, wifi_csi_info_t *info)
 {
     (void)ctx;
-    if (!info || !info->buf || !info->len || info->len > NODE_MAX_CSI) return;
+    if (!info) return;
     csi_record_t r;
     if (!node_parse_action(info->payload, info->payload_len, &r.packet) ||
         r.packet.type != NODE_DATA || !node_source_valid(r.packet.tx_id, info->mac)) return;
@@ -203,10 +209,19 @@ static void csi_cb(void *ctx, wifi_csi_info_t *info)
                   (r.packet.rx_mask & (1u << (config.id - 1u))) &&
                   (!logged_slot_valid || logged_slot != r.packet.slot);
     if (accept) {
-        r.receiver = config.id;
-        r.generation = generation;
-        logged_slot = r.packet.slot;
-        logged_slot_valid = true;
+        /* Observe only the expected DATA link, including rejected CSI sizes.
+         * Controls, unrelated stations, and old grants never affect stats. */
+        if (info->len < csi_len_min) csi_len_min = info->len;
+        if (info->len > csi_len_max) csi_len_max = info->len;
+        if (!info->buf || !node_csi_length_valid(info->len)) {
+            csi_invalid_length_dropped++;
+            accept = false;
+        } else {
+            r.receiver = config.id;
+            r.generation = generation;
+            logged_slot = r.packet.slot;
+            logged_slot_valid = true;
+        }
     }
     portEXIT_CRITICAL(&lock);
     if (!accept) return;
@@ -319,7 +334,7 @@ static void handle_command(char *line)
         unsigned long phase = strtoul(tokens[5], &end_phase, 10);
         node_config_t candidate = {
             .id = (uint8_t)(tokens[2][0] - 'A' + 1),
-            .mode = !strcmp(tokens[3], "1X3") ? 1 : !strcmp(tokens[3], "2X2") ? 2 : 0,
+            .mode = node_mode_from_name(tokens[3]),
             .rate_hz = rate <= UINT16_MAX ? (uint16_t)rate : 0,
             .phase_ms = phase <= 600000 ? (uint32_t)phase : 0
         };
@@ -348,6 +363,7 @@ static void handle_command(char *line)
         have_grant = response_sent = sent_slot_valid = logged_slot_valid = false;
         tx_count = csi_count = csi_dropped = late_dropped = send_errors = 0;
         grant_rx_count = grant_age_max = grant_expired = 0; grant_age_min = UINT32_MAX;
+        csi_len_min = UINT32_MAX; csi_len_max = csi_invalid_length_dropped = 0;
         tx_completions[0] = tx_completions[1] = tx_age_max[0] = tx_age_max[1] = 0;
         tx_age_min[0] = tx_age_min[1] = UINT32_MAX;
         guard_extensions = fault_type = fault_age_us = 0; guard_extension_us = 0;

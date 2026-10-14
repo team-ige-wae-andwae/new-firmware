@@ -65,6 +65,13 @@ $stage = (Resolve-Path -LiteralPath $StageDirectory).Path
 if ($stage -match '[^\x00-\x7F]') { throw 'Use an ASCII-only staging path, for example C:\temp\ige-csi-node.' }
 Copy-Item -LiteralPath "$source\CMakeLists.txt", "$source\sdkconfig.defaults" -Destination $stage -Force
 Copy-Item -LiteralPath "$source\main" -Destination $stage -Recurse -Force
+$sourceNames = @('CMakeLists.txt', 'sdkconfig.defaults', 'main/CMakeLists.txt', 'main/app_main.c', 'main/node_protocol.h')
+# Build the same canonical LF bytes recorded in Git, including on Windows.
+foreach ($name in $sourceNames) {
+    $path = Join-Path $stage $name
+    $text = [IO.File]::ReadAllText($path).Replace("`r`n", "`n")
+    [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
+}
 Push-Location $stage
 try {
     if (-not (Test-Path -LiteralPath 'sdkconfig')) {
@@ -97,14 +104,19 @@ try {
         (Get-FileHash -LiteralPath (Join-Path $output $name) -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $name
     }
     Set-Content -LiteralPath "$output\SHA256SUMS" -Value $hashLines -Encoding ascii
-    $sourceNames = @('CMakeLists.txt', 'sdkconfig.defaults', 'main/CMakeLists.txt', 'main/app_main.c', 'main/node_protocol.h')
     $sourceHashes = foreach ($name in $sourceNames) {
         [ordered]@{ path = "csi_node/$name"; sha256 = (Get-FileHash -LiteralPath (Join-Path $stage $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
     }
+    $description = Get-Content -LiteralPath 'build\project_description.json' -Raw | ConvertFrom-Json
+    $app = Get-Item -LiteralPath "$output\csi_node.bin"
     [ordered]@{
+        firmware_version = $description.project_version
         idf_version = "$idfVersion"; target = 'esp32s3'; source_files = @($sourceHashes)
         binary_files = $binaryNames; flash_settings = $flasher.flash_settings; flash_files = $flasher.flash_files
-        hardware_validation = 'The original 1X3/2X2 source baseline passed a two-board hardware test. This script only builds and packages firmware; every rebuilt binary requires its own hardware retest.'
+        app_sha256 = (Get-FileHash -LiteralPath $app.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        app_bytes = $app.Length
+        source_hash_note = 'Build inputs and source hashes use canonical UTF-8 LF bytes, matching the repository files.'
+        hardware_validation = 'This binary has not been flashed or hardware-tested. RR4 four-board timing, reception, and loss rates require measurement. Earlier two-board 1X3/2X2 results belong to a different binary.'
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$output\build-info.json" -Encoding utf8
     Write-Output "Firmware package updated: $output"
 } finally { Pop-Location }

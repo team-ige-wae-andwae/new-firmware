@@ -12,6 +12,7 @@
 #define NODE_DATA 2
 #define NODE_MODE_1X3 1
 #define NODE_MODE_2X2 2
+#define NODE_MODE_RR4 3
 #define NODE_RESPONSE_DELAY_US 1000
 #define NODE_ENQUEUE_DEADLINE_US 2500
 #define NODE_DATA_WATCHDOG_US 8000
@@ -25,8 +26,8 @@
 typedef struct {
     uint8_t id;                 /* 1=A ... 4=D; 0 is unconfigured */
     uint8_t mode;
-    uint16_t rate_hz;           /* per active transmitter */
-    uint32_t phase_ms;
+    uint16_t rate_hz;           /* RR4: per node; legacy: per active transmitter */
+    uint32_t phase_ms;          /* RR4: full four-slot cycle; 2X2: role phase */
 } node_config_t;
 
 /* Fixed little-endian ESP32 wire layout, below the single ESP-NOW IE limit. */
@@ -57,18 +58,51 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(node_packet_t) == 36, "wire layout changed");
 
+static inline const char *node_mode_name(uint8_t mode)
+{
+    switch (mode) {
+        case NODE_MODE_1X3: return "1X3";
+        case NODE_MODE_2X2: return "2X2";
+        case NODE_MODE_RR4: return "RR4";
+        default: return "UNKNOWN";
+    }
+}
+
+static inline uint8_t node_mode_from_name(const char *name)
+{
+    if (!name) return 0;
+    if (!strcmp(name, "1X3")) return NODE_MODE_1X3;
+    if (!strcmp(name, "2X2")) return NODE_MODE_2X2;
+    if (!strcmp(name, "RR4")) return NODE_MODE_RR4;
+    return 0;
+}
+
+static inline uint32_t node_mode_slot_multiplier(uint8_t mode)
+{
+    switch (mode) {
+        case NODE_MODE_1X3: return 1;
+        case NODE_MODE_2X2: return 2;
+        case NODE_MODE_RR4: return 4;
+        default: return 0;
+    }
+}
+
 static inline uint32_t node_slot_us(const node_config_t *c)
 {
-    return 1000000u / ((uint32_t)c->rate_hz * (c->mode == NODE_MODE_2X2 ? 2u : 1u));
+    uint32_t total = (uint32_t)c->rate_hz * node_mode_slot_multiplier(c->mode);
+    return total ? 1000000u / total : 0;
 }
 
 static inline bool node_config_valid(const node_config_t *c)
 {
-    if (c->id < 1 || c->id > 4 || (c->mode != 1 && c->mode != 2) ||
-        c->rate_hz < 5 || c->rate_hz > 40 || c->phase_ms < 1000 ||
-        c->phase_ms > 600000) return false;
-    uint32_t total = c->rate_hz * (c->mode == 2 ? 2u : 1u);
-    return 1000000u % total == 0 &&
+    if (c->id < 1 || c->id > 4 || !node_mode_slot_multiplier(c->mode) ||
+        c->rate_hz < 5 || c->rate_hz > 40) return false;
+    uint32_t total = c->rate_hz * node_mode_slot_multiplier(c->mode);
+    if (1000000u % total != 0) return false;
+    if (c->mode == NODE_MODE_RR4) {
+        return c->rate_hz <= 20 && (uint64_t)c->phase_ms * c->rate_hz == 1000;
+    }
+    return c->phase_ms >= 1000 && c->phase_ms <= 600000 &&
            ((uint64_t)c->phase_ms * c->rate_hz) % 1000 == 0;
 }
 
@@ -89,14 +123,24 @@ static inline bool node_source_valid(uint8_t id, const uint8_t mac[6])
 static inline node_packet_t node_make_grant(const node_config_t *c,
                                            uint32_t session, uint32_t slot)
 {
-    uint32_t phase = c->mode == 2 ? slot / ((c->phase_ms * c->rate_hz * 2u) / 1000u) : 0;
-    uint8_t tx = c->mode == 2 ? (uint8_t)(1u + (phase % 2u) * 2u + slot % 2u) : 1;
+    uint32_t phase = 0;
+    uint8_t tx = 1;
+    uint8_t rx_mask = 0x0e;
+    if (c->mode == NODE_MODE_RR4) {
+        phase = slot / 4u;
+        tx = (uint8_t)(1u + slot % 4u);
+        rx_mask = (uint8_t)(0x0fu & ~(1u << (tx - 1u)));
+    } else if (c->mode == NODE_MODE_2X2) {
+        phase = slot / ((c->phase_ms * c->rate_hz * 2u) / 1000u);
+        tx = (uint8_t)(1u + (phase % 2u) * 2u + slot % 2u);
+        rx_mask = phase % 2u ? 0x03 : 0x0c;
+    }
     node_packet_t p = {
         .magic = NODE_MAGIC, .version = NODE_VERSION, .type = NODE_GRANT,
         .size = sizeof(node_packet_t), .session = session, .phase = phase,
         .slot = slot, .seq = slot, .phase_ms = c->phase_ms,
         .rate_hz = c->rate_hz, .mode = c->mode, .tx_id = tx,
-        .rx_mask = c->mode == 2 ? (phase % 2u ? 0x03 : 0x0c) : 0x0e,
+        .rx_mask = rx_mask,
     };
     return p;
 }
@@ -165,10 +209,15 @@ static inline bool node_parse_action(const uint8_t *b, size_t len, node_packet_t
 }
 
 /* RFC 4648, preserves the original signed int8 CSI byte representation. */
+static inline bool node_csi_length_valid(size_t len)
+{
+    return len > 0 && len <= NODE_MAX_CSI;
+}
+
 static inline bool node_csi_base64(const int8_t *data, size_t len, char *out, size_t capacity)
 {
     static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    if (!data || !out || len > NODE_MAX_CSI || capacity < 4 * ((len + 2) / 3) + 1) return false;
+    if (!data || !out || !node_csi_length_valid(len) || capacity < 4 * ((len + 2) / 3) + 1) return false;
     size_t at = 0;
     for (size_t i = 0; i < len; i += 3) {
         uint32_t bits = (uint32_t)(uint8_t)data[i] << 16;

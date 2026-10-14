@@ -32,6 +32,104 @@ static void schedules(void)
     c.id = 0; assert(!node_config_valid(&c));
 }
 
+static void rr4_configuration(void)
+{
+    assert(NODE_MODE_RR4 == 3 && NODE_VERSION == 2);
+    assert(sizeof(node_packet_t) == 36);
+    assert(node_mode_from_name("RR4") == NODE_MODE_RR4);
+    assert(node_mode_from_name("1X3") == NODE_MODE_1X3);
+    assert(node_mode_from_name("2X2") == NODE_MODE_2X2);
+    assert(node_mode_from_name("rr4") == 0);
+    assert(node_mode_from_name("1X4") == 0);
+    assert(node_mode_from_name(NULL) == 0);
+    assert(!strcmp(node_mode_name(NODE_MODE_RR4), "RR4"));
+    assert(!strcmp(node_mode_name(NODE_MODE_1X3), "1X3"));
+    assert(!strcmp(node_mode_name(NODE_MODE_2X2), "2X2"));
+    assert(!strcmp(node_mode_name(255), "UNKNOWN"));
+    node_config_t c = {.id = 1, .mode = NODE_MODE_RR4, .rate_hz = 20, .phase_ms = 50};
+    assert(node_config_valid(&c) && node_slot_us(&c) == 12500);
+    const uint16_t rates[] = {5, 8, 10, 20};
+    const uint32_t cycles[] = {200, 125, 100, 50};
+    for (unsigned i = 0; i < 4; i++) {
+        c.rate_hz = rates[i]; c.phase_ms = cycles[i];
+        assert(node_config_valid(&c));
+        assert(node_slot_us(&c) * 4 == c.phase_ms * 1000);
+    }
+    c.rate_hz = 20; c.phase_ms = 5000; assert(!node_config_valid(&c));
+    c.rate_hz = 40; c.phase_ms = 50; assert(!node_config_valid(&c));
+    c.rate_hz = 40; c.phase_ms = 5000; assert(!node_config_valid(&c));
+    c.rate_hz = 20; c.phase_ms = 49; assert(!node_config_valid(&c));
+    c.phase_ms = 51; assert(!node_config_valid(&c));
+    c.phase_ms = UINT32_MAX; assert(!node_config_valid(&c));
+    c.phase_ms = 50; c.rate_hz = 21; assert(!node_config_valid(&c));
+    c.rate_hz = 16; c.phase_ms = 62; assert(!node_config_valid(&c));
+    c.rate_hz = 4; c.phase_ms = 250; assert(!node_config_valid(&c));
+    c.rate_hz = 20; c.phase_ms = 50;
+    for (uint8_t id = 1; id <= 4; id++) { c.id = id; assert(node_config_valid(&c)); }
+    c.id = 0; assert(!node_config_valid(&c));
+    c.id = 5; assert(!node_config_valid(&c));
+    c.id = 1; c.mode = 255; assert(!node_config_valid(&c));
+    assert(node_slot_us(&c) == 0);
+    /* Stored valid legacy configuration remains accepted after the upgrade. */
+    c.mode = NODE_MODE_1X3; c.rate_hz = 40; c.phase_ms = 5000;
+    assert(node_config_valid(&c) && node_slot_us(&c) == 25000);
+    c.mode = NODE_MODE_2X2;
+    assert(node_config_valid(&c) && node_slot_us(&c) == 12500);
+}
+
+static void rr4_schedule_and_wire(void)
+{
+    node_config_t c = {.id = 1, .mode = NODE_MODE_RR4, .rate_hz = 20, .phase_ms = 50};
+    unsigned links[4][4] = {{0}};
+    unsigned sent[4] = {0};
+    uint32_t last_slot[4] = {0};
+    const uint8_t masks[4] = {0x0e, 0x0d, 0x0b, 0x07};
+    for (uint32_t slot = 0; slot < 400; slot++) {
+        node_packet_t p = node_make_grant(&c, 321, slot);
+        assert(node_packet_valid(&p, sizeof(p), &c, 321));
+        assert(p.phase == slot / 4 && p.tx_id == 1 + slot % 4);
+        assert(p.slot == slot && p.seq == slot && p.rx_mask == masks[slot % 4]);
+        unsigned sender = p.tx_id - 1;
+        if (sent[sender]) assert(slot - last_slot[sender] == 4);
+        last_slot[sender] = slot; sent[sender]++;
+        for (unsigned receiver = 0; receiver < 4; receiver++) {
+            bool receives = (p.rx_mask & (1u << receiver)) != 0;
+            assert(receives == (receiver != sender));
+            if (receives) links[sender][receiver]++;
+            assert(node_can_respond(&p, (uint8_t)(receiver + 1), 1000, false, false) ==
+                   (receiver == sender));
+        }
+    }
+    /* Every 50 ms cycle samples all 12 directed links exactly once. */
+    for (unsigned tx = 0; tx < 4; tx++) {
+        assert(sent[tx] == 100);
+        for (unsigned rx = 0; rx < 4; rx++) assert(links[tx][rx] == (tx == rx ? 0u : 100u));
+    }
+    const uint32_t boundaries[] = {0, 3, 4, 7, 8, 255, 256, UINT32_MAX - 4,
+                                  UINT32_MAX - 3, UINT32_MAX - 2, UINT32_MAX - 1, UINT32_MAX};
+    for (unsigned i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
+        uint32_t slot = boundaries[i];
+        node_packet_t p = node_make_grant(&c, 321, slot);
+        assert(node_packet_valid(&p, sizeof(p), &c, 321));
+        assert(p.phase == slot / 4 && p.tx_id == 1 + slot % 4);
+        assert(p.rx_mask == masks[slot % 4] && p.seq == slot);
+    }
+    node_packet_t p = node_make_grant(&c, 321, 5), bad = p;
+    assert(p.phase == 1 && p.tx_id == 2 && p.rx_mask == 0x0d);
+    bad.rx_mask = 0x0f; assert(!node_packet_valid(&bad, sizeof(bad), &c, 321));
+    bad = p; bad.tx_id = 1; assert(!node_packet_valid(&bad, sizeof(bad), &c, 321));
+    bad = p; bad.phase = 0; assert(!node_packet_valid(&bad, sizeof(bad), &c, 321));
+    bad = p; bad.seq++; assert(!node_packet_valid(&bad, sizeof(bad), &c, 321));
+    bad = p; bad.phase_ms = 5000; assert(!node_packet_valid(&bad, sizeof(bad), &c, 321));
+    bad = p; bad.mode = NODE_MODE_2X2; assert(!node_packet_valid(&bad, sizeof(bad), &c, 321));
+    bad = p; bad.type = NODE_DATA; assert(node_packet_valid(&bad, sizeof(bad), &c, 321));
+    /* A receiver configured in a legacy mode rejects a new-mode packet. */
+    c.mode = NODE_MODE_2X2; c.rate_hz = 40; c.phase_ms = 5000;
+    assert(!node_packet_valid(&p, sizeof(p), &c, 321));
+    c.mode = NODE_MODE_1X3;
+    assert(!node_packet_valid(&p, sizeof(p), &c, 321));
+}
+
 static void grants_and_sessions(void)
 {
     node_config_t c = {.id = 3, .mode = 2, .rate_hz = 40, .phase_ms = 5000};
@@ -96,6 +194,26 @@ static void bounded_parser(void)
     assert(decoded.type == NODE_DATA);
 }
 
+static size_t decode_base64_for_test(const char *text, uint8_t *out, size_t capacity)
+{
+    const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint32_t accumulator = 0;
+    unsigned bits = 0;
+    size_t count = 0;
+    for (const char *p = text; *p && *p != '='; p++) {
+        const char *digit = strchr(alphabet, *p);
+        assert(digit != NULL);
+        accumulator = (accumulator << 6) | (uint32_t)(digit - alphabet);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            assert(count < capacity);
+            out[count++] = (uint8_t)(accumulator >> bits);
+        }
+    }
+    return count;
+}
+
 static void base64(void)
 {
     int8_t values[] = {0, 1, 127, -128, -1};
@@ -108,6 +226,27 @@ static void base64(void)
     assert(node_csi_base64(maximum, sizeof(maximum), out, sizeof(out)));
     assert(strlen(out) == 1024);
     assert(!node_csi_base64(maximum, sizeof(maximum) + 1, out, sizeof(out)));
+    assert(!node_csi_length_valid(0));
+    assert(!node_csi_length_valid(NODE_MAX_CSI + 1));
+    assert(!node_csi_length_valid(SIZE_MAX));
+    assert(!node_csi_base64(values, 0, out, sizeof(out)));
+    assert(!node_csi_base64(NULL, 1, out, sizeof(out)));
+    assert(!node_csi_base64(values, 1, NULL, sizeof(out)));
+    assert(!node_csi_base64(values, SIZE_MAX, out, sizeof(out)));
+    uint8_t decoded[NODE_MAX_CSI];
+    for (size_t i = 0; i < sizeof(maximum); i++) maximum[i] = (int8_t)(uint8_t)(i * 37u);
+    for (size_t len = 1; len <= NODE_MAX_CSI; len++) {
+        assert(node_csi_length_valid(len));
+        size_t encoded_len = 4 * ((len + 2) / 3);
+        assert(node_csi_base64(maximum, len, out, encoded_len + 1));
+        assert(strlen(out) == encoded_len);
+        assert(decode_base64_for_test(out, decoded, sizeof(decoded)) == len);
+        for (size_t i = 0; i < len; i++) assert(decoded[i] == (uint8_t)maximum[i]);
+        if (len % 3 == 1) assert(out[encoded_len - 1] == '=' && out[encoded_len - 2] == '=');
+        if (len % 3 == 2) assert(out[encoded_len - 1] == '=' && out[encoded_len - 2] != '=');
+        if (len % 3 == 0) assert(out[encoded_len - 1] != '=');
+        assert(!node_csi_base64(maximum, len, out, encoded_len));
+    }
 }
 
 static void late_radio_guard(void)
@@ -137,7 +276,8 @@ static void late_radio_guard(void)
 
 int main(void)
 {
-    schedules(); grants_and_sessions(); bounded_parser(); base64(); late_radio_guard();
+    schedules(); rr4_configuration(); rr4_schedule_and_wire();
+    grants_and_sessions(); bounded_parser(); base64(); late_radio_guard();
     puts("node_protocol: schedule/phase, grant expiry, wrong-session/source, parser bounds passed");
     return 0;
 }
